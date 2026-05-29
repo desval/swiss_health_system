@@ -20,3 +20,6 @@ ENV/
 
 # Claude local machine settings
 .claude/settings.local.json
+
+# Local review guidance not meant for version control
+referee_instructions/
