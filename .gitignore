@@ -1,0 +1,22 @@
+# OS and editor files
+Thumbs.db
+.DS_Store
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environment files
+.env
+.env.*
+
+# Claude local machine settings
+.claude/settings.local.json
