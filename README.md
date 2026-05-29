@@ -25,7 +25,6 @@ It generates synthetic insured populations, simulates realized costs, assigns in
 - [code/](code/) contains the simulation code.
 - [output/figures/](output/figures/) contains generated charts from simulation runs.
 - [paper/](paper/) contains project notes and draft paper sections.
-- [referee_instructions/](referee_instructions/) contains evaluation criteria and section-specific writing guidance.
 - [requirements.txt](requirements.txt) lists the Python packages needed to run the simulation.
 
 ## Setup
