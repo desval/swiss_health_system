@@ -24,6 +24,7 @@ Dependencies: openpyxl, pandas (pip install openpyxl pandas)
 import argparse
 import csv
 import os
+import re
 import sys
 
 import openpyxl
@@ -53,6 +54,227 @@ def _stamp(df: pd.DataFrame, source_file: str, source_sheet: str, year: int, rev
 
 
 # ── era parsers ───────────────────────────────────────────────────────────────
+
+# ─ Phase 1 helpers ────────────────────────────────────────────────────────────
+
+_CANTON_CODE_RE = re.compile(r'^[A-Z]{2}$')
+
+def _parse_risk_group_label(label: str) -> dict:
+    """
+    Extract sex, age_band, birth_year_from, birth_year_to from a Phase 1 risk-group
+    label string such as 'Frauen 19 - 25 J. / Jg. 1981-1975 (R 1)'.
+    """
+    sex = None
+    if "frauen" in label.lower():
+        sex = "F"
+    elif "m\xe4nner" in label.lower() or "manner" in label.lower():
+        sex = "M"
+
+    age_m = re.search(r"(\d+)\s*[-\u2013]\s*(\d+)\s*J", label)
+    age_plus = re.search(r"(\d+)\s*\+\s*J", label)
+    if age_m:
+        age_band = f"{age_m.group(1)}-{age_m.group(2)}"
+    elif age_plus:
+        age_band = f"{age_plus.group(1)}+"
+    else:
+        age_band = None
+
+    birth_m = re.search(r"Jg\.\s*(\d+)[-\u2013](\d+)", label)
+    birth_year_from = int(birth_m.group(1)) if birth_m else None
+    birth_year_to   = int(birth_m.group(2)) if birth_m else None
+
+    return {"sex": sex, "age_band": age_band, "birth_year_from": birth_year_from, "birth_year_to": birth_year_to}
+
+
+def _parse_r_sheets(wb: openpyxl.Workbook, filename: str, year: int, revision: int, prefixes: list[str]) -> pd.DataFrame | None:
+    """
+    Parse per-risk-group R-sheets (1999-2010) or F/M-sheets (1997).
+
+    Each sheet covers one adult risk group across all cantons.
+    Column offsets differ by sheet family:
+      R-sheets (1999-2010):  canton=col[0], months=col[2], cost=col[4], sharing=col[6]
+      F/M-sheets (1997):     canton=col[0], months=col[1], cost=col[3], sharing=col[5]
+
+    Children (0-18) are not covered by R/F/M sheets and are omitted.
+    """
+    all_dfs = []
+
+    for sheet_name in wb.sheetnames:
+        prefix = next((p for p in prefixes if sheet_name.startswith(p)), None)
+        if prefix is None:
+            continue
+        suffix = sheet_name[len(prefix):]
+        if not suffix.isdigit():
+            continue
+
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True, max_row=50))
+        if len(rows) < 4:
+            continue
+
+        # Risk group label is in row 2 (0-indexed)
+        label = str(rows[2][0]).strip() if rows[2] and rows[2][0] is not None else ""
+        rg_info = _parse_risk_group_label(label)
+        rg_info["risk_group"] = sheet_name
+
+        # Determine column offsets by finding where "Monate" first appears
+        monat_col = None
+        for ri in range(3, min(10, len(rows))):
+            for ci, cell in enumerate(rows[ri]):
+                if cell is not None and "monat" in str(cell).lower():
+                    monat_col = ci
+                    break
+            if monat_col is not None:
+                break
+
+        if monat_col == 1:
+            # F/M-sheet layout (1997)
+            canton_col, months_col, cost_col, sharing_col = 0, 1, 3, 5
+        else:
+            # R-sheet layout (1999-2010); default monat_col=2
+            canton_col, months_col, cost_col, sharing_col = 0, 2, 4, 6
+
+        # Find where data rows begin: first row after headers where col[0] looks like a canton
+        data_start = None
+        for ri in range(5, min(15, len(rows))):
+            cell = rows[ri][canton_col] if len(rows[ri]) > canton_col else None
+            if cell is not None and isinstance(cell, str):
+                s = cell.strip()
+                if _CANTON_CODE_RE.match(s) or s == "CH":
+                    data_start = ri
+                    break
+        if data_start is None:
+            continue
+
+        data = []
+        for row in rows[data_start:]:
+            canton = row[canton_col] if len(row) > canton_col else None
+            if canton is None or not isinstance(canton, str):
+                continue
+            canton_str = canton.strip()
+            if not (_CANTON_CODE_RE.match(canton_str) or canton_str == "CH"):
+                continue
+            months  = row[months_col]  if len(row) > months_col  else None
+            cost    = row[cost_col]    if len(row) > cost_col    else None
+            sharing = row[sharing_col] if len(row) > sharing_col else None
+            data.append({"canton": canton_str, "insured_months": months,
+                         "total_cost_chf": cost, "cost_sharing_chf": sharing, **rg_info})
+
+        if data:
+            all_dfs.append(pd.DataFrame(data))
+
+    if not all_dfs:
+        return None
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    for col in ["insured_months", "total_cost_chf", "cost_sharing_chf"]:
+        combined[col] = pd.to_numeric(combined[col], errors="coerce")
+    return combined
+
+
+def _parse_monate_sheet(wb: openpyxl.Workbook) -> pd.DataFrame | None:
+    """
+    Parse 1996/1998 'Monate, Kosten, Kobe' long-format sheet.
+
+    Row 0 = column headers; data from row 1.
+    Columns: Kantonskürzel | Kantonsnummer | Geschlecht | Geburtsjahr von | bis | Monate | Kosten | Kostenbeteiligung
+    No age_band or prior_hospitalisation columns (pre-reform).
+    """
+    target = next((n for n in wb.sheetnames if "monate" in n.lower()), None)
+    if target is None:
+        return None
+
+    ws = wb[target]
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return None
+
+    headers = [str(c).strip() if c is not None else f"col_{i}" for i, c in enumerate(rows[0])]
+    data_rows = [r for r in rows[1:] if any(c is not None for c in r)]
+    if not data_rows:
+        return None
+
+    df = pd.DataFrame(data_rows, columns=headers[: len(data_rows[0])])
+
+    rename_map = {}
+    for col in df.columns:
+        lc = col.lower()
+        if "kantonsk" in lc:
+            rename_map[col] = "canton"
+        elif "kantonsnummer" in lc:
+            rename_map[col] = "_drop_canton_number"
+        elif "geschlecht" in lc:
+            rename_map[col] = "sex"
+        elif "von" in lc:
+            rename_map[col] = "birth_year_from"
+        elif "bis" in lc:
+            rename_map[col] = "birth_year_to"
+        elif "kostenbeteiligung" in lc:
+            rename_map[col] = "cost_sharing_chf"
+        elif "kosten" in lc:
+            rename_map[col] = "total_cost_chf"
+        elif "monate" in lc:
+            rename_map[col] = "insured_months"
+    df = df.rename(columns=rename_map)
+
+    drop_cols = [c for c in df.columns if c.startswith("_drop_")]
+    df = df.drop(columns=drop_cols, errors="ignore")
+
+    if "canton" in df.columns:
+        df = df[df["canton"].notna() & (df["canton"].astype(str).str.strip() != "")]
+
+    # Normalize sex: "F / f" -> "F"
+    if "sex" in df.columns:
+        df["sex"] = df["sex"].astype(str).str.extract(r"([FMfm])")[0].str.upper()
+
+    for col in ["insured_months", "total_cost_chf", "cost_sharing_chf", "birth_year_from", "birth_year_to"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df, target
+
+
+def parse_phase1_canton_risk_group(wb: openpyxl.Workbook, filename: str, year: int, revision: int) -> pd.DataFrame | None:
+    """
+    Route Phase 1 (1996–2011) workbook to the appropriate sub-parser.
+
+    Sub-schemas detected by sheet presence:
+      - 'Daten YYYY'         → Phase-2-compatible long format (2011); reuse Phase 2 parser
+      - 'Monate, Kosten, Kobe' → 1996/1998 long format
+      - R1…R30 sheets        → 1999–2010 wide format (adult risk groups only)
+      - F1…F15 + M1…M15      → 1997 wide format
+    """
+    sheet_names = wb.sheetnames
+
+    # 2011: already Phase 2 compatible
+    if any(s.lower().startswith("daten") for s in sheet_names):
+        return parse_phase2_canton_risk_group(wb, filename, year, revision)
+
+    # 1996, 1998: simple long format
+    if any("monate" in s.lower() for s in sheet_names):
+        result = _parse_monate_sheet(wb)
+        if result is None:
+            return None
+        df, sheet_name = result
+        return _stamp(df, filename, sheet_name, year, revision)
+
+    # 1999-2010: R-sheet format
+    if any(s.startswith("R") and s[1:].isdigit() for s in sheet_names):
+        df = _parse_r_sheets(wb, filename, year, revision, ["R"])
+        if df is not None:
+            return _stamp(df, filename, "R_sheets", year, revision)
+        return None
+
+    # 1997: F/M-sheet format
+    if any(s.startswith("F") and s[1:].isdigit() for s in sheet_names):
+        df = _parse_r_sheets(wb, filename, year, revision, ["F", "M"])
+        if df is not None:
+            return _stamp(df, filename, "FM_sheets", year, revision)
+        return None
+
+    print(f"  SKIP {filename}: unrecognized Phase 1 sub-format (sheets: {sheet_names[:5]})")
+    return None
+
 
 def parse_phase2_canton_risk_group(wb: openpyxl.Workbook, filename: str, year: int, revision: int) -> pd.DataFrame | None:
     """
@@ -442,7 +664,11 @@ def main():
                 print(f"    canton_risk_group: {len(df_canton)} rows")
 
         else:
-            print(f"    SKIP: phase1_legacy parsers not yet implemented (wide pivoted format requires manual schema mapping)")
+            # phase1_legacy
+            df = parse_phase1_canton_risk_group(wb, fname, year, revision)
+            if df is not None:
+                all_canton.append(df)
+                print(f"    canton_risk_group: {len(df)} rows")
 
         wb.close()
 
