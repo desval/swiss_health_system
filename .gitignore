@@ -18,6 +18,9 @@ ENV/
 .env
 .env.*
 
+# data
+data/
+
 # Claude local machine settings
 .claude/settings.local.json
 
