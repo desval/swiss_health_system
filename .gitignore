@@ -18,8 +18,14 @@ ENV/
 .env
 .env.*
 
-# data
-data/
+# data: exclude large binary source files but track documentation
+data/**/*.xlsx
+data/**/*.xls
+data/**/*.csv
+data/**/*.zip
+
+# Generated output data (CSVs produced by consolidation scripts)
+output/data/
 
 # Claude local machine settings
 .claude/settings.local.json
